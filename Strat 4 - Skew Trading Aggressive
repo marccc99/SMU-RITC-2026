@@ -1,0 +1,164 @@
+import requests
+import time
+import sys
+import json
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+API_KEY = 'JJXREJ93'
+BASE_URL = 'http://localhost:9999/v1'
+HEADERS = {'X-API-Key': API_KEY}
+
+TICKERS = ['WNTR', 'SMMR']
+HARD_GROSS_LIMIT = 50000   
+HARD_NET_LIMIT = 30000       
+
+# AGGREGATED SAFETY BUFFERS
+SAFETY_GROSS_CAP = 47700     
+SAFETY_NET_CAP = 26800       # Aggregated Portfolio Net Ceiling
+MAX_ORDER_SIZE = 4200        
+MAX_SINGLE_ORDER = 10000     # Structural API Limit (The Chopper)
+
+# --- STRAT PARAMETERS (INTACT) ---
+BASE_HALF_SPREAD = 0.01    
+PUSH_COEFF = 0.04          
+PULL_COEFF = 0.02          
+DEFENSIVE_PULL = 0.5    #(0.7 for more conservative unwinding at minute close)  
+MIN_MKT_SPREAD = 0.02      
+
+LOOP_SPEED = 0.13          #0.13 for halifax testing, may be able to use lower number once geographically in toronto to capture latency decrease (0.1-0.12)  
+shadow_pos = {t: 0 for t in TICKERS}
+last_quotes = {t: {'buy': 0, 'sell': 0} for t in TICKERS}
+price_hist = {t: [] for t in TICKERS}
+
+# ==========================================
+# ATOMIC CHOPPER & OPTIMISTIC POSTING
+# ==========================================
+def post_order(ticker, action, quantity, type, price=None):
+    """Slices orders > 10k into chunks and updates shadow immediately."""
+    global shadow_pos
+    if quantity < 1: return
+    rem = int(quantity)
+    
+    while rem > 0:
+        # THE TRADE CHOPPER: Never sends more than 10k per request
+        chunk = min(rem, MAX_SINGLE_ORDER)
+        params = {'ticker': ticker, 'action': action, 'quantity': chunk, 'type': type}
+        if price: params['price'] = price
+        
+        try:
+            resp = requests.post(f"{BASE_URL}/orders", headers=HEADERS, params=params)
+            if resp.status_code == 200:
+                # OPTIMISTIC UPDATE: Assume fill to block double-spending
+                shadow_pos[ticker] += chunk if action == 'BUY' else -chunk
+                print(f"  [OK] {action} {chunk} {ticker} | Shadow: {shadow_pos[ticker]}")
+            else:
+                try:
+                    err = resp.json().get('code', 'UNKNOWN')
+                    print(f"  !!! [REJECTED] {resp.status_code} | {err} | {action} {chunk}")
+                except: pass
+        except Exception as e:
+            print(f"  !!! [NETWORK ERROR] {str(e)}")
+        rem -= chunk
+
+def cancel_ticker(ticker):
+    try: requests.post(f"{BASE_URL}/commands/cancel", headers=HEADERS, params={'ticker': ticker})
+    except: pass
+
+# ==========================================
+# AGGREGATED TRADING LOGIC
+# ==========================================
+def market_make_ticker(ticker_info, sec):
+    global shadow_pos, last_quotes, price_hist, pipeline_filled
+    ticker = ticker_info['ticker']
+    server_pos = int(ticker_info['position'])
+    
+    # RECONCILIATION: Fix shadow if orders are resting unfilled
+    try:
+        open_orders = requests.get(f"{BASE_URL}/orders", headers=HEADERS, params={'status': 'OPEN'}).json()
+        net_open = sum((o['quantity'] - o['filled']) if o['action'] == 'BUY' else -(o['quantity'] - o['filled']) 
+                       for o in open_orders if o['ticker'] == ticker)
+        shadow_pos[ticker] = server_pos + net_open
+    except: shadow_pos[ticker] = server_pos
+
+    is_risk_reduction = (sec >= 52 or sec < 3)
+    book = get_book(ticker)
+    if not book or not book.get('bids'): return
+    mid_price = (book['bids'][0]['price'] + book['asks'][0]['price']) / 2.0
+    
+    # Volatility Adjustment
+    price_hist[ticker].append(mid_price)
+    if len(price_hist[ticker]) > 10: price_hist[ticker].pop(0)
+    vol_adj = min(0.06, (max(price_hist[ticker]) - min(price_hist[ticker])) * 0.5) if len(price_hist[ticker]) > 1 else 0
+
+    # --- AGGREGATED COMPLIANCE ENGINE ---
+    # Calculate the total portfolio net risk
+    total_portfolio_net = sum(shadow_pos.values())
+    global_net_buy_room = SAFETY_NET_CAP - total_portfolio_net
+    global_net_sell_room = SAFETY_NET_CAP + total_portfolio_net
+
+    # SKEW LOGIC (INTACT)
+    current_pull = DEFENSIVE_PULL if is_risk_reduction else PULL_COEFF
+    inv_ratio = shadow_pos[ticker] / (SAFETY_NET_CAP / 2) # Scaled for portfolio share
+    
+    if inv_ratio > 0:
+        bid_h, ask_h = BASE_HALF_SPREAD + vol_adj + (PUSH_COEFF * inv_ratio), max(0.01, BASE_HALF_SPREAD + vol_adj - (current_pull * inv_ratio))
+    else:
+        ask_h, bid_h = BASE_HALF_SPREAD + vol_adj + (PUSH_COEFF * abs(inv_ratio)), max(0.01, BASE_HALF_SPREAD + vol_adj - (current_pull * abs(inv_ratio)))
+
+    t_bid, t_ask = round(mid_price - bid_h, 2), round(mid_price + ask_h, 2)
+    if (t_ask - t_bid) < MIN_MKT_SPREAD: t_ask = t_bid + MIN_MKT_SPREAD
+
+    if abs(t_bid - last_quotes[ticker]['buy']) < 0.01 and abs(t_ask - last_quotes[ticker]['sell']) < 0.01:
+        return
+
+    cancel_ticker(ticker)
+    last_quotes[ticker]['buy'], last_quotes[ticker]['sell'] = t_bid, t_ask
+    
+    if is_risk_reduction:
+        # Dump using Chopper to avoid server 500s
+        unwind_qty = abs(server_pos)
+        if server_pos < 0: post_order(ticker, 'BUY', unwind_qty, 'LIMIT', t_bid)
+        if server_pos > 0: post_order(ticker, 'SELL', unwind_qty, 'LIMIT', t_ask)
+    else:
+        # AGGREGATED ROOM COMPLIANCE
+        total_gross = sum(abs(v) for v in shadow_pos.values())
+        remaining_gross = SAFETY_GROSS_CAP - total_gross
+        
+        if remaining_gross > 0:
+            qty_limit = min(MAX_ORDER_SIZE, remaining_gross // 2)
+            f_buy = int(max(0, min(qty_limit, global_net_buy_room)))
+            f_sell = int(max(0, min(qty_limit, global_net_sell_room)))
+            
+            if f_buy > 0: post_order(ticker, 'BUY', f_buy, 'LIMIT', t_bid)
+            if f_sell > 0: post_order(ticker, 'SELL', f_sell, 'LIMIT', t_ask)
+
+def get_book(ticker):
+    try: return requests.get(f"{BASE_URL}/securities/book", headers=HEADERS, params={'ticker': ticker}).json()
+    except: return None
+
+def main():
+    print("=== v960: Skew Market Maker ===")
+    while True:
+        try:
+            case = requests.get(f"{BASE_URL}/case", headers=HEADERS).json()
+            if not case or case['status'] != 'ACTIVE': time.sleep(1); continue
+            tick, sec = case['tick'], (case['tick'] % 60)
+            
+            securities = requests.get(f"{BASE_URL}/securities", headers=HEADERS).json()
+            # MONITOR: Aggregated Portfolio Net
+            agg_net = sum(s['position'] for s in securities if s['ticker'] in TICKERS)
+            print(f"\n[TICK {tick}] AGG NET: {int(agg_net)} | WNTR: {int(securities[1]['position'])} | SMMR: {int(securities[0]['position'])}")
+            
+            for t_name in TICKERS:
+                s_info = next((s for s in securities if s['ticker'] == t_name), None)
+                if s_info: market_make_ticker(s_info, sec)
+
+            time.sleep(LOOP_SPEED)
+        except Exception as e:
+            print(f"MAIN ERR: {e}")
+            time.sleep(1)
+
+if __name__ == "__main__":
+    main()
