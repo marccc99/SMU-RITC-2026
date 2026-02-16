@@ -23,7 +23,7 @@ TICKERS = ['WNTR', 'SMMR']
 # Size 6000 allows us to hold 4 layers (24000) within the 30000 cap.
 # And 22,600 + 7,400 (Ghost Fill) = 30,000 (Exact Limit).
 MAX_ORDER_SIZE = 6000        
-SAFETY_NET_CAP = 18000       
+SAFETY_NET_CAP = 24000       
 SAFETY_GROSS_CAP = 54000     
 MAX_SINGLE_ORDER = 10000     
 
